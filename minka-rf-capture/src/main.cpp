@@ -1,6 +1,6 @@
 /*
- * MinkaAire RF Signal Capture - v2 (wider sensitivity)
- * 
+ * MinkaAire RF Signal Capture - v2.1 (wider sensitivity + noise squelch)
+ *
  * Changes from v1:
  *   - Much wider RX bandwidth (650 kHz vs 135 kHz)
  *   - Lower data rate (1.0 kbps) for broader pulse capture
@@ -8,6 +8,14 @@
  *     if the light buttons produce ANY RF energy at 303.875 MHz
  *   - Lower MIN_PULSES threshold (8 vs 20) to catch shorter frames
  *   - Added raw bit stream output for easier protocol decoding
+ *
+ * Changes in v2.1:
+ *   - Added an RSSI noise squelch. The wide-band, max-gain OOK front end
+ *     slices ambient RF noise into edges whenever no real carrier is present,
+ *     which flooded the log with fake "captures". We now track the peak signal
+ *     strength during each burst and discard any burst that never rises above
+ *     CARRIER_THRESHOLD_DBM. Peak RSSI is printed per capture so the threshold
+ *     can be calibrated against a real remote press.
  */
 
 #include <Arduino.h>
@@ -27,10 +35,18 @@
 #define GAP_TIMEOUT_US 15000
 #define MIN_PULSES     8       // Lowered from 20 to catch shorter frames
 
+// Noise squelch: reject any burst whose peak signal strength never rises above
+// this level (dBm). The OOK slicer chops ambient noise into edges when there is
+// no real carrier; a genuine remote press reads well above the noise floor.
+// TUNE THIS: compare the "[noise ignored]" peak values (the floor) against the
+// "Peak RSSI" of a real button press, then set this between the two.
+#define CARRIER_THRESHOLD_DBM -52
+
 // ---- RSSI monitoring ----
 #define RSSI_INTERVAL_MS 500   // Print RSSI every 500ms
 unsigned long lastRssiPrint = 0;
 bool rssiMode = true;          // Set false to suppress RSSI spam
+int  captureRssiPeak = -200;   // Peak RSSI (dBm) seen during the current burst
 
 // ---- Pulse buffer ----
 volatile unsigned long pulseTimes[MAX_PULSES];
@@ -68,10 +84,10 @@ void setup() {
     Serial.println("  Data pin  : GDO0 -> D26");
     Serial.println("===========================================");
     Serial.println();
-    Serial.println("RSSI values will print every 500ms.");
-    Serial.println("Baseline (no signal) is around -70 to -90 dBm.");
-    Serial.println("A button press should spike above -50 dBm.");
-    Serial.println("Type 'q' in serial to toggle RSSI output.");
+    Serial.println("RSSI floor prints every 500ms while idle.");
+    Serial.printf("Noise squelch: bursts peaking below %d dBm are ignored.\n", CARRIER_THRESHOLD_DBM);
+    Serial.println("A real button press should read well above the noise floor.");
+    Serial.println("Type 'q' in serial to toggle RSSI/diagnostic output.");
     Serial.println();
 
     ELECHOUSE_cc1101.setSpiPin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
@@ -103,10 +119,19 @@ void setup() {
 }
 
 void loop() {
-    // ---- RSSI monitoring ----
-    if (rssiMode && !capturing && (millis() - lastRssiPrint >= RSSI_INTERVAL_MS)) {
+    // ---- Track peak signal strength during an active burst ----
+    // Sample RSSI continuously while a burst is being captured so we know how
+    // strong it actually got. This peak is what the noise squelch checks below.
+    if (capturing) {
         int rssi = readRSSI();
-        Serial.printf("[RSSI] %d dBm\n", rssi);
+        if (rssi > captureRssiPeak) {
+            captureRssiPeak = rssi;
+        }
+    }
+
+    // ---- RSSI floor monitoring (idle only) ----
+    if (rssiMode && !capturing && (millis() - lastRssiPrint >= RSSI_INTERVAL_MS)) {
+        Serial.printf("[RSSI] %d dBm\n", readRSSI());
         lastRssiPrint = millis();
     }
 
@@ -135,11 +160,30 @@ void loop() {
     capturing   = false;
     interrupts();
 
-    if (count < MIN_PULSES) return;
+    if (count < MIN_PULSES) {
+        captureRssiPeak = -200;   // reset for the next burst
+        return;
+    }
+
+    // ---- Noise squelch ----
+    // A burst that never rose above the carrier threshold is ambient noise the
+    // OOK demod sliced into edges, not a real remote frame. Discard it. We print
+    // a compact one-liner (when diagnostics are on) so the noise floor stays
+    // visible for calibrating CARRIER_THRESHOLD_DBM.
+    int peakRssi = captureRssiPeak;
+    captureRssiPeak = -200;       // reset for the next burst
+    if (peakRssi < CARRIER_THRESHOLD_DBM) {
+        if (rssiMode) {
+            Serial.printf("[noise ignored] %d pulses, peak RSSI %d dBm (below %d threshold)\n",
+                          count, peakRssi, CARRIER_THRESHOLD_DBM);
+        }
+        return;
+    }
 
     // ---- Print capture ----
     Serial.println("===== SIGNAL CAPTURED =====");
     Serial.printf("Pulses: %d\n", count);
+    Serial.printf("Peak RSSI: %d dBm\n", peakRssi);
     Serial.println();
 
     // Raw pulse list
