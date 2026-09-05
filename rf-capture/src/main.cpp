@@ -1,25 +1,35 @@
 /*
- * MinkaAire RF Signal Capture - v2.1 (wider sensitivity + noise squelch)
+ * rf-capture: OOK signal capture and fingerprinting - v2.2
+ *
+ * Captures On-Off Keying (OOK/ASK) remote-control signals with an ESP32 + CC1101,
+ * squelches ambient noise, and prints a stable per-button "fingerprint".
  *
  * Changes from v1:
  *   - Much wider RX bandwidth (650 kHz vs 135 kHz)
  *   - Lower data rate (1.0 kbps) for broader pulse capture
- *   - RSSI monitoring: prints signal strength every 500ms so you can see
- *     if the light buttons produce ANY RF energy at 303.875 MHz
+ *   - RSSI monitoring: prints signal strength every 500ms
  *   - Lower MIN_PULSES threshold (8 vs 20) to catch shorter frames
- *   - Added raw bit stream output for easier protocol decoding
  *
  * Changes in v2.1:
- *   - Added an RSSI noise squelch. The wide-band, max-gain OOK front end
- *     slices ambient RF noise into edges whenever no real carrier is present,
- *     which flooded the log with fake "captures". We now track the peak signal
- *     strength during each burst and discard any burst that never rises above
- *     CARRIER_THRESHOLD_DBM. Peak RSSI is printed per capture so the threshold
- *     can be calibrated against a real remote press.
+ *   - Added an RSSI noise squelch. The wide-band, max-gain OOK front end slices
+ *     ambient RF noise into edges whenever no real carrier is present, which
+ *     flooded the log with fake "captures". We track the peak signal strength
+ *     during each burst and discard any burst that never rises above
+ *     CARRIER_THRESHOLD_DBM. Peak RSSI is printed per capture for calibration.
+ *
+ * Changes in v2.2:
+ *   - Replaced the whole-blob bit decoder with an adaptive frame-segmentation
+ *     decoder: it splits each burst into frames on adaptively-detected
+ *     inter-frame gaps (no hardcoded gap length), decodes each gap-anchored
+ *     frame to bits, discards glitch-corrupted frames, and majority-votes across
+ *     the repeats to print one stable fingerprint (bits + hex) with a confidence
+ *     line. The raw pulse dump moved behind the 'r' serial toggle.
  */
 
 #include <Arduino.h>
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include <stdlib.h>   // qsort
+#include <string.h>   // memcpy, strcmp, strcpy, strlen
 
 // ---- Pin assignments ----
 #define PIN_GDO0  26
@@ -32,7 +42,7 @@
 // ---- Capture settings ----
 #define FREQ_MHZ       303.875
 #define MAX_PULSES     600
-#define GAP_TIMEOUT_US 15000
+#define GAP_TIMEOUT_US 15000   // No edges for this long => the burst is over
 #define MIN_PULSES     8       // Lowered from 20 to catch shorter frames
 
 // Noise squelch: reject any burst whose peak signal strength never rises above
@@ -41,6 +51,15 @@
 // TUNE THIS: compare the "[noise ignored]" peak values (the floor) against the
 // "Peak RSSI" of a real button press, then set this between the two.
 #define CARRIER_THRESHOLD_DBM -52
+
+// ---- Frame-segmentation decoder settings ----
+// The frame gap is derived from the signal, not hardcoded: any pulse longer than
+// GAP_FACTOR x the median pulse (floored at GAP_MIN_US) is treated as the dead
+// gap between repeated frames.
+#define GAP_FACTOR      4
+#define GAP_MIN_US      2000
+#define MAX_FRAMES      32     // most repeated frames we vote across
+#define MAX_FRAME_BITS  40     // most bit-cells we decode per frame
 
 // ---- RSSI monitoring ----
 #define RSSI_INTERVAL_MS 500   // Print RSSI every 500ms
@@ -53,6 +72,14 @@ volatile unsigned long pulseTimes[MAX_PULSES];
 volatile int           pulseIndex = 0;
 volatile unsigned long lastEdgeUs = 0;
 volatile bool          capturing  = false;
+
+// ---- Last accepted capture (snapshot for the 'r' raw dump) ----
+unsigned long lastCaptured[MAX_PULSES];
+int           lastCount = 0;
+
+// Scratch buffer for the median sort. Kept off the stack on purpose: loop()
+// already holds a MAX_PULSES stack array, so a second one there risks overflow.
+static unsigned long sortBuf[MAX_PULSES];
 
 void IRAM_ATTR onEdge() {
     unsigned long now = micros();
@@ -68,14 +95,142 @@ int readRSSI() {
     return rssi;
 }
 
+// Ascending compare for qsort over unsigned long.
+static int cmpUL(const void *a, const void *b) {
+    unsigned long x = *(const unsigned long *)a;
+    unsigned long y = *(const unsigned long *)b;
+    if (x < y) { return -1; }
+    if (x > y) { return 1; }
+    return 0;
+}
+
+// Derive the inter-frame gap threshold from the capture itself, so we never
+// hardcode a device-specific gap. Bit pulses dominate the count, so the median
+// sits among them; real inter-frame gaps are many times larger.
+unsigned long deriveGapThreshold(const unsigned long *p, int n) {
+    if (n <= 0) { return GAP_MIN_US; }
+    memcpy(sortBuf, p, n * sizeof(unsigned long));
+    qsort(sortBuf, n, sizeof(unsigned long), cmpUL);
+    unsigned long median = sortBuf[n / 2];
+    unsigned long thr = GAP_FACTOR * median;
+    return (thr < GAP_MIN_US) ? GAP_MIN_US : thr;
+}
+
+// Derive the short/long divider for bit pulses (those below the gap threshold).
+// With roughly equal numbers of short and long pulses, their mean falls between
+// the two clusters and separates them.
+unsigned long deriveBitThreshold(const unsigned long *p, int n, unsigned long gapThr) {
+    unsigned long sum = 0;
+    int cnt = 0;
+    for (int i = 0; i < n; i++) {
+        if (p[i] < gapThr) {
+            sum += p[i];
+            cnt++;
+        }
+    }
+    if (cnt == 0) { return gapThr / 2; }
+    return sum / cnt;
+}
+
+// Decode one gap-anchored frame (pulses [start, end), starting on an ON pulse)
+// into a '0'/'1' string. Returns the bit count, or -1 if the frame is corrupt.
+// Durations only; the HIGH/LOW parity labels are ignored (they become unreliable
+// once a glitch has shifted the edge parity).
+int decodeFrame(const unsigned long *p, int start, int end,
+                unsigned long bitThr, char *outBits) {
+    int len = end - start;
+    if (len <= 0 || (len % 2) != 0) { return -1; }   // must be whole (ON,OFF) cells
+    int bits = len / 2;
+    if (bits > MAX_FRAME_BITS) { return -1; }
+
+    int b = 0;
+    for (int i = start; i + 1 < end; i += 2) {
+        unsigned long on  = p[i];
+        unsigned long off = p[i + 1];
+        if (on < bitThr && off > bitThr) {
+            outBits[b++] = '0';               // short-ON, long-OFF
+        } else if (on > bitThr && off < bitThr) {
+            outBits[b++] = '1';               // long-ON, short-OFF
+        } else {
+            return -1;                        // both short or both long -> corrupt
+        }
+    }
+    outBits[b] = '\0';
+    return b;
+}
+
+// Convert an MSB-first bit string to hex (left-padded to whole nibbles).
+void bitsToHex(const char *bits, char *outHex) {
+    int n = (int)strlen(bits);
+    int pad = (4 - (n % 4)) % 4;              // virtual leading zeros
+    int total = n + pad;
+    int oi = 0;
+    const char *digits = "0123456789ABCDEF";
+    for (int nib = 0; nib < total; nib += 4) {
+        int val = 0;
+        for (int k = 0; k < 4; k++) {
+            int idx = nib + k - pad;
+            int bit = (idx < 0) ? 0 : (bits[idx] - '0');
+            val = (val << 1) | bit;
+        }
+        outHex[oi++] = digits[val];
+    }
+    outHex[oi] = '\0';
+}
+
+// Dump the most recent accepted capture: raw pulse table plus per-frame decode,
+// for debugging when a fingerprint looks weak. Triggered by 'r' over serial.
+void dumpLastRaw() {
+    if (lastCount == 0) {
+        Serial.println("[raw] no capture yet");
+        return;
+    }
+    unsigned long gapThr = deriveGapThreshold(lastCaptured, lastCount);
+    unsigned long bitThr = deriveBitThreshold(lastCaptured, lastCount, gapThr);
+
+    Serial.println("----- RAW DUMP (last capture) -----");
+    Serial.printf("Pulses: %d   gap > %lu us   short/long @ %lu us\n",
+                  lastCount, gapThr, bitThr);
+    Serial.println("Index | Duration (us) | note");
+    Serial.println("------|---------------|-----");
+    for (int i = 0; i < lastCount; i++) {
+        const char *note = (lastCaptured[i] > gapThr) ? "GAP" : "";
+        Serial.printf("%5d | %13lu | %s\n", i, lastCaptured[i], note);
+    }
+
+    Serial.println("Frames (between gaps):");
+    int prevGap = -1;
+    int frameNo = 0;
+    bool anyFrame = false;
+    for (int i = 0; i < lastCount; i++) {
+        if (lastCaptured[i] > gapThr) {
+            if (prevGap >= 0 && i > prevGap + 1) {
+                char bits[MAX_FRAME_BITS + 1];
+                int nbits = decodeFrame(lastCaptured, prevGap + 1, i, bitThr, bits);
+                if (nbits < 0) {
+                    Serial.printf("  frame %d: CORRUPT (%d pulses)\n", frameNo++, i - (prevGap + 1));
+                } else {
+                    Serial.printf("  frame %d: %s (%d bits)\n", frameNo++, bits, nbits);
+                }
+                anyFrame = true;
+            }
+            prevGap = i;
+        }
+    }
+    if (!anyFrame) {
+        Serial.println("  (no bracketed frames -> need a repeating signal)");
+    }
+    Serial.println("-----------------------------------");
+}
+
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
     Serial.println();
     Serial.println("===========================================");
-    Serial.println("  MinkaAire RF Signal Capture v2");
-    Serial.println("  (wider bandwidth, higher sensitivity)");
+    Serial.println("  rf-capture: OOK signal capture");
+    Serial.println("  (wide bandwidth, high sensitivity)");
     Serial.println("===========================================");
     Serial.printf("  Frequency : %.3f MHz\n", FREQ_MHZ);
     Serial.println("  Modulation: OOK / ASK");
@@ -87,7 +242,7 @@ void setup() {
     Serial.println("RSSI floor prints every 500ms while idle.");
     Serial.printf("Noise squelch: bursts peaking below %d dBm are ignored.\n", CARRIER_THRESHOLD_DBM);
     Serial.println("A real button press should read well above the noise floor.");
-    Serial.println("Type 'q' in serial to toggle RSSI/diagnostic output.");
+    Serial.println("Serial: 'q' toggles diagnostics, 'r' dumps raw pulses of the last capture.");
     Serial.println();
 
     ELECHOUSE_cc1101.setSpiPin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
@@ -135,12 +290,14 @@ void loop() {
         lastRssiPrint = millis();
     }
 
-    // ---- Toggle RSSI output if user sends 'q' ----
+    // ---- Serial commands: 'q' toggle diagnostics, 'r' raw dump ----
     if (Serial.available()) {
         char c = Serial.read();
         if (c == 'q' || c == 'Q') {
             rssiMode = !rssiMode;
             Serial.printf("[RSSI monitoring %s]\n", rssiMode ? "ON" : "OFF");
+        } else if (c == 'r' || c == 'R') {
+            dumpLastRaw();
         }
     }
 
@@ -180,97 +337,92 @@ void loop() {
         return;
     }
 
-    // ---- Print capture ----
-    Serial.println("===== SIGNAL CAPTURED =====");
-    Serial.printf("Pulses: %d\n", count);
-    Serial.printf("Peak RSSI: %d dBm\n", peakRssi);
-    Serial.println();
+    // ---- Decode: segment into frames, vote across repeats ----
+    // Snapshot this capture for the on-demand raw dump ('r').
+    memcpy(lastCaptured, captured, count * sizeof(unsigned long));
+    lastCount = count;
 
-    // Raw pulse list
-    Serial.println("Index | Duration (us) | State");
-    Serial.println("------|---------------|------");
-    for (int i = 0; i < count; i++) {
-        Serial.printf("%5d | %13lu | %s\n",
-                      i, captured[i],
-                      (i % 2 == 0) ? "HIGH" : "LOW ");
-    }
+    unsigned long gapThr = deriveGapThreshold(captured, count);
+    unsigned long bitThr = deriveBitThreshold(captured, count, gapThr);
 
-    // Bit stream interpretation
-    // Determine threshold between "short" and "long" pulses
-    // by finding the midpoint of the two clusters
-    unsigned long shortSum = 0, longSum = 0;
-    int shortCount = 0, longCount = 0;
-    for (int i = 0; i < count; i++) {
-        if (captured[i] < 500) {
-            shortSum += captured[i];
-            shortCount++;
-        } else if (captured[i] < 1000) {
-            longSum += captured[i];
-            longCount++;
+    // Find gap indices. Frames are the pulses strictly between two consecutive
+    // gaps: those are guaranteed to start on an ON pulse (the first edge after a
+    // dead gap), which fixes the bit alignment.
+    int gapIdx[MAX_FRAMES + 2];
+    int nGaps = 0;
+    for (int i = 0; i < count && nGaps < MAX_FRAMES + 2; i++) {
+        if (captured[i] > gapThr) {
+            gapIdx[nGaps++] = i;
         }
     }
 
-    if (shortCount > 0 && longCount > 0) {
-        unsigned long shortAvg = shortSum / shortCount;
-        unsigned long longAvg = longSum / longCount;
-        unsigned long threshold = (shortAvg + longAvg) / 2;
+    Serial.println("===== BUTTON SIGNAL =====");
+    Serial.printf("Peak RSSI : %d dBm\n", peakRssi);
 
+    if (nGaps < 2) {
+        Serial.println("No complete frame (need a repeating signal). Press 'r' for raw pulses.");
+        Serial.println("=========================");
         Serial.println();
-        Serial.printf("Short pulse avg: %lu us (%d pulses)\n", shortAvg, shortCount);
-        Serial.printf("Long pulse avg:  %lu us (%d pulses)\n", longAvg, longCount);
-        Serial.printf("Threshold:       %lu us\n", threshold);
+        Serial.println("Listening... press another button.");
         Serial.println();
+        return;
+    }
 
-        // Decode: look at pairs of (HIGH, LOW) durations
-        // Short-Long = "0", Long-Short = "1" (common OOK convention)
-        Serial.print("Bit stream: ");
-        for (int i = 0; i < count - 1; i += 2) {
-            unsigned long high = captured[i];
-            unsigned long low  = captured[i + 1];
-
-            // Skip gaps (>5000 us = frame separator)
-            if (high > 5000 || low > 5000) {
-                Serial.print(" | ");
-                continue;
-            }
-
-            if (high < threshold && low > threshold) {
-                Serial.print("0");
-            } else if (high > threshold && low < threshold) {
-                Serial.print("1");
-            } else if (high < threshold && low < threshold) {
-                Serial.print("s");  // both short (unusual)
-            } else {
-                Serial.print("L");  // both long (unusual)
-            }
+    // Decode each gap-bracketed frame; collect the clean bit-strings.
+    char frames[MAX_FRAMES][MAX_FRAME_BITS + 1];
+    int  frameCount = 0;
+    int  seen = 0, dropped = 0;
+    for (int g = 0; g + 1 < nGaps; g++) {
+        int start = gapIdx[g] + 1;
+        int end   = gapIdx[g + 1];
+        if (end <= start) { continue; }
+        seen++;
+        char bits[MAX_FRAME_BITS + 1];
+        int nbits = decodeFrame(captured, start, end, bitThr, bits);
+        if (nbits < 0) {
+            dropped++;
+            continue;
         }
+        if (frameCount < MAX_FRAMES) {
+            strcpy(frames[frameCount++], bits);
+        }
+    }
+
+    if (frameCount == 0) {
+        Serial.printf("Frames    : %d seen, 0 clean, %d dropped (glitch)\n", seen, dropped);
+        Serial.println("All frames corrupt (check the encoding assumption). Press 'r' for raw pulses.");
+        Serial.println("=========================");
         Serial.println();
+        Serial.println("Listening... press another button.");
+        Serial.println();
+        return;
     }
 
-    // Histogram
-    Serial.println();
-    Serial.println("Pulse duration histogram:");
-    int buckets[10] = {0};
-    unsigned long limits[] = {100, 200, 400, 600, 800, 1200, 2000, 4000, 8000};
-    for (int i = 0; i < count; i++) {
-        int b = 9;
-        for (int j = 0; j < 9; j++) {
-            if (captured[i] < limits[j]) { b = j; break; }
+    // Majority vote: the most common identical bit-string wins.
+    int bestIdx = 0, bestVotes = 0;
+    for (int i = 0; i < frameCount; i++) {
+        int votes = 0;
+        for (int j = 0; j < frameCount; j++) {
+            if (strcmp(frames[i], frames[j]) == 0) { votes++; }
         }
-        buckets[b]++;
-    }
-    const char* labels[] = {
-        "   0-100 us", " 100-200 us", " 200-400 us", " 400-600 us",
-        " 600-800 us", " 800-1200us", "1200-2000us", "2000-4000us",
-        "4000-8000us", "   8000+ us"
-    };
-    for (int i = 0; i < 10; i++) {
-        if (buckets[i] > 0) {
-            Serial.printf("  %s : %d pulses\n", labels[i], buckets[i]);
-        }
+        if (votes > bestVotes) { bestVotes = votes; bestIdx = i; }
     }
 
-    Serial.println("===== END =====");
+    char hex[MAX_FRAME_BITS / 4 + 2];
+    bitsToHex(frames[bestIdx], hex);
+
+    Serial.printf("Frames    : %d seen, %d clean, %d dropped (glitch)\n",
+                  seen, frameCount, dropped);
+    Serial.printf("Fingerprint: %s  (%d bits)  hex 0x%s\n",
+                  frames[bestIdx], (int)strlen(frames[bestIdx]), hex);
+    if (bestVotes == frameCount) {
+        Serial.printf("Agreement : %d/%d clean frames identical  [OK]\n", bestVotes, frameCount);
+    } else {
+        Serial.printf("Agreement : %d/%d clean frames agree  [weak: rolling code or wrong encoding?]\n",
+                      bestVotes, frameCount);
+    }
+    Serial.println("(press 'r' to dump raw pulses for this capture)");
+    Serial.println("=========================");
     Serial.println();
     Serial.println("Listening... press another button.");
     Serial.println();
