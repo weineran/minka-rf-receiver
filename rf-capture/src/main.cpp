@@ -133,27 +133,22 @@ unsigned long deriveBitThreshold(const unsigned long *p, int n, unsigned long ga
 }
 
 // Decode one gap-anchored frame (pulses [start, end), starting on an ON pulse)
-// into a '0'/'1' string. Returns the bit count, or -1 if the frame is corrupt.
-// Durations only; the HIGH/LOW parity labels are ignored (they become unreliable
-// once a glitch has shifted the edge parity).
-int decodeFrame(const unsigned long *p, int start, int end,
-                unsigned long bitThr, char *outBits) {
-    int len = end - start;
-    if (len <= 0 || (len % 2) != 0) { return -1; }   // must be whole (ON,OFF) cells
-    int bits = len / 2;
-    if (bits > MAX_FRAME_BITS) { return -1; }
-
+// into a '0'/'1' string. One bit per (ON, OFF) cell, decided by relative
+// duration: long-ON/short-OFF -> '1', short-ON/long-OFF -> '0'. Relative compare
+// means no cell is ever "ambiguous", so a low-contrast or glitchy frame still
+// decodes (its bits just may be wrong, which the per-frame listing reveals).
+//
+// A frame is inherently an ODD pulse count: the last bit's OFF is the long
+// inter-frame gap (stripped during segmentation), leaving a trailing lone ON.
+// We decode only whole cells and ignore that trailing pulse.
+// Durations only; the HIGH/LOW parity labels are ignored (unreliable once a
+// glitch has shifted the edge parity). Returns the bit count.
+int decodeFrame(const unsigned long *p, int start, int end, char *outBits) {
     int b = 0;
-    for (int i = start; i + 1 < end; i += 2) {
+    for (int i = start; i + 1 < end && b < MAX_FRAME_BITS; i += 2) {
         unsigned long on  = p[i];
         unsigned long off = p[i + 1];
-        if (on < bitThr && off > bitThr) {
-            outBits[b++] = '0';               // short-ON, long-OFF
-        } else if (on > bitThr && off < bitThr) {
-            outBits[b++] = '1';               // long-ON, short-OFF
-        } else {
-            return -1;                        // both short or both long -> corrupt
-        }
+        outBits[b++] = (on > off) ? '1' : '0';
     }
     outBits[b] = '\0';
     return b;
@@ -206,12 +201,9 @@ void dumpLastRaw() {
         if (lastCaptured[i] > gapThr) {
             if (prevGap >= 0 && i > prevGap + 1) {
                 char bits[MAX_FRAME_BITS + 1];
-                int nbits = decodeFrame(lastCaptured, prevGap + 1, i, bitThr, bits);
-                if (nbits < 0) {
-                    Serial.printf("  frame %d: CORRUPT (%d pulses)\n", frameNo++, i - (prevGap + 1));
-                } else {
-                    Serial.printf("  frame %d: %s (%d bits)\n", frameNo++, bits, nbits);
-                }
+                int nbits = decodeFrame(lastCaptured, prevGap + 1, i, bits);
+                Serial.printf("  frame %d: %s (%d bits, %d pulses)\n",
+                              frameNo++, bits, nbits, i - (prevGap + 1));
                 anyFrame = true;
             }
             prevGap = i;
@@ -343,7 +335,6 @@ void loop() {
     lastCount = count;
 
     unsigned long gapThr = deriveGapThreshold(captured, count);
-    unsigned long bitThr = deriveBitThreshold(captured, count, gapThr);
 
     // Find gap indices. Frames are the pulses strictly between two consecutive
     // gaps: those are guaranteed to start on an ON pulse (the first edge after a
@@ -368,58 +359,33 @@ void loop() {
         return;
     }
 
-    // Decode each gap-bracketed frame; collect the clean bit-strings.
+    // Decode every gap-bracketed frame and list them, so we can see directly
+    // whether the repeats agree. (Debug view while we characterize the signal;
+    // this replaces the single voted fingerprint until the repeats are stable.)
     char frames[MAX_FRAMES][MAX_FRAME_BITS + 1];
     int  frameCount = 0;
-    int  seen = 0, dropped = 0;
-    for (int g = 0; g + 1 < nGaps; g++) {
+    for (int g = 0; g + 1 < nGaps && frameCount < MAX_FRAMES; g++) {
         int start = gapIdx[g] + 1;
         int end   = gapIdx[g + 1];
         if (end <= start) { continue; }
-        seen++;
-        char bits[MAX_FRAME_BITS + 1];
-        int nbits = decodeFrame(captured, start, end, bitThr, bits);
-        if (nbits < 0) {
-            dropped++;
-            continue;
-        }
-        if (frameCount < MAX_FRAMES) {
-            strcpy(frames[frameCount++], bits);
-        }
+        decodeFrame(captured, start, end, frames[frameCount]);
+        frameCount++;
     }
 
-    if (frameCount == 0) {
-        Serial.printf("Frames    : %d seen, 0 clean, %d dropped (glitch)\n", seen, dropped);
-        Serial.println("All frames corrupt (check the encoding assumption). Press 'r' for raw pulses.");
-        Serial.println("=========================");
-        Serial.println();
-        Serial.println("Listening... press another button.");
-        Serial.println();
-        return;
-    }
-
-    // Majority vote: the most common identical bit-string wins.
-    int bestIdx = 0, bestVotes = 0;
+    Serial.printf("Frames    : %d\n", frameCount);
+    bool allMatch = true;
     for (int i = 0; i < frameCount; i++) {
-        int votes = 0;
-        for (int j = 0; j < frameCount; j++) {
-            if (strcmp(frames[i], frames[j]) == 0) { votes++; }
-        }
-        if (votes > bestVotes) { bestVotes = votes; bestIdx = i; }
+        Serial.printf("  frame %d: %s\n", i, frames[i]);
+        if (i > 0 && strcmp(frames[i], frames[0]) != 0) { allMatch = false; }
     }
 
-    char hex[MAX_FRAME_BITS / 4 + 2];
-    bitsToHex(frames[bestIdx], hex);
-
-    Serial.printf("Frames    : %d seen, %d clean, %d dropped (glitch)\n",
-                  seen, frameCount, dropped);
-    Serial.printf("Fingerprint: %s  (%d bits)  hex 0x%s\n",
-                  frames[bestIdx], (int)strlen(frames[bestIdx]), hex);
-    if (bestVotes == frameCount) {
-        Serial.printf("Agreement : %d/%d clean frames identical  [OK]\n", bestVotes, frameCount);
+    if (allMatch) {
+        char hex[MAX_FRAME_BITS / 4 + 2];
+        bitsToHex(frames[0], hex);
+        Serial.printf("Fingerprint: %s  (%d bits)  hex 0x%s  [all %d frames match]\n",
+                      frames[0], (int)strlen(frames[0]), hex, frameCount);
     } else {
-        Serial.printf("Agreement : %d/%d clean frames agree  [weak: rolling code or wrong encoding?]\n",
-                      bestVotes, frameCount);
+        Serial.println("Frames DIFFER -> no stable fingerprint yet (compare the per-frame bits above).");
     }
     Serial.println("(press 'r' to dump raw pulses for this capture)");
     Serial.println("=========================");
