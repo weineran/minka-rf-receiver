@@ -64,7 +64,7 @@
 // ---- RSSI monitoring ----
 #define RSSI_INTERVAL_MS 500   // Print RSSI every 500ms
 unsigned long lastRssiPrint = 0;
-bool rssiMode = true;          // Set false to suppress RSSI spam
+bool rssiMode = false;         // Diagnostics off by default; 'q' toggles the RSSI floor + [noise ignored] lines
 int  captureRssiPeak = -200;   // Peak RSSI (dBm) seen during the current burst
 
 // ---- Pulse buffer ----
@@ -252,9 +252,8 @@ void setup() {
     Serial.println("  Data pin  : GDO0 -> D26");
     Serial.println("===========================================");
     Serial.println();
-    Serial.println("RSSI floor prints every 500ms while idle.");
     Serial.printf("Noise squelch: bursts peaking below %d dBm are ignored.\n", CARRIER_THRESHOLD_DBM);
-    Serial.println("A real button press should read well above the noise floor.");
+    Serial.println("Diagnostics (RSSI floor + [noise ignored]) OFF by default; 'q' toggles them.");
     Serial.println("Serial keys: q=diagnostics  r=raw dump  +/-=RX bandwidth  g=cycle gain");
     Serial.println();
 
