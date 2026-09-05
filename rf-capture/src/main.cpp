@@ -81,6 +81,18 @@ int           lastCount = 0;
 // already holds a MAX_PULSES stack array, so a second one there risks overflow.
 static unsigned long sortBuf[MAX_PULSES];
 
+// ---- Live-tunable front end (adjust over serial: + / - / g) ----
+// RX bandwidth steps (kHz), matching the CC1101's discrete filter settings.
+const float RXBW_STEPS[] = {58, 68, 81, 102, 116, 135, 162, 203,
+                            232, 270, 325, 406, 464, 541, 650, 812};
+const int   RXBW_COUNT   = sizeof(RXBW_STEPS) / sizeof(RXBW_STEPS[0]);
+int rxbwIndex = 14;   // start at 650 kHz (the v2 wide setting)
+
+// AGCCTRL2 values from most to least LNA gain. Less gain = less noise slicing.
+const uint8_t AGC_STEPS[] = {0x03, 0x0B, 0x13, 0x1B};
+const int     AGC_COUNT   = sizeof(AGC_STEPS) / sizeof(AGC_STEPS[0]);
+int agcIndex = 0;     // start at max gain (the v2 sensitive setting)
+
 void IRAM_ATTR onEdge() {
     unsigned long now = micros();
     if (lastEdgeUs > 0 && pulseIndex < MAX_PULSES) {
@@ -93,6 +105,16 @@ void IRAM_ATTR onEdge() {
 int readRSSI() {
     int rssi = ELECHOUSE_cc1101.getRssi();
     return rssi;
+}
+
+// Apply the current RX bandwidth and AGC gain, then re-enter RX. Called at boot
+// and whenever the user steps the front end over serial.
+void applyFrontEnd() {
+    ELECHOUSE_cc1101.setRxBW(RXBW_STEPS[rxbwIndex]);
+    ELECHOUSE_cc1101.SpiWriteReg(0x1B, AGC_STEPS[agcIndex]);  // AGCCTRL2 (LNA gain)
+    ELECHOUSE_cc1101.SetRx(FREQ_MHZ);
+    Serial.printf("[front-end] RX BW = %.0f kHz, gain(AGCCTRL2) = 0x%02X\n",
+                  RXBW_STEPS[rxbwIndex], AGC_STEPS[agcIndex]);
 }
 
 // Ascending compare for qsort over unsigned long.
@@ -226,7 +248,6 @@ void setup() {
     Serial.println("===========================================");
     Serial.printf("  Frequency : %.3f MHz\n", FREQ_MHZ);
     Serial.println("  Modulation: OOK / ASK");
-    Serial.println("  RX BW     : 650 kHz (wide)");
     Serial.println("  Data rate : 1.0 kbps");
     Serial.println("  Data pin  : GDO0 -> D26");
     Serial.println("===========================================");
@@ -234,7 +255,7 @@ void setup() {
     Serial.println("RSSI floor prints every 500ms while idle.");
     Serial.printf("Noise squelch: bursts peaking below %d dBm are ignored.\n", CARRIER_THRESHOLD_DBM);
     Serial.println("A real button press should read well above the noise floor.");
-    Serial.println("Serial: 'q' toggles diagnostics, 'r' dumps raw pulses of the last capture.");
+    Serial.println("Serial keys: q=diagnostics  r=raw dump  +/-=RX bandwidth  g=cycle gain");
     Serial.println();
 
     ELECHOUSE_cc1101.setSpiPin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CSN);
@@ -244,19 +265,16 @@ void setup() {
     ELECHOUSE_cc1101.setModulation(2);   // ASK/OOK
     ELECHOUSE_cc1101.setMHZ(FREQ_MHZ);
     ELECHOUSE_cc1101.setDRate(1.0);      // Lower data rate for wider pulse acceptance
-    ELECHOUSE_cc1101.setRxBW(650.0);     // Much wider bandwidth
     ELECHOUSE_cc1101.setSyncMode(0);     // No sync word
     ELECHOUSE_cc1101.setPktFormat(3);    // Async serial on GDO0
 
-    // Increase sensitivity via AGC settings
-    // AGCCTRL2: max LNA gain, target amplitude 33dB
-    ELECHOUSE_cc1101.SpiWriteReg(0x1B, 0x03);  // AGCCTRL2: max gain
-    // AGCCTRL1: relative carrier sense disabled
+    // AGCCTRL1 (carrier sense) and AGCCTRL0 (hysteresis). The LNA gain (AGCCTRL2)
+    // and the RX bandwidth are applied by applyFrontEnd() so they can be tuned
+    // live over serial.
     ELECHOUSE_cc1101.SpiWriteReg(0x1C, 0x00);  // AGCCTRL1
-    // AGCCTRL0: medium hysteresis, 16 samples
     ELECHOUSE_cc1101.SpiWriteReg(0x1D, 0x91);  // AGCCTRL0
 
-    ELECHOUSE_cc1101.SetRx(FREQ_MHZ);
+    applyFrontEnd();   // sets RX bandwidth + gain, then enters RX
 
     pinMode(PIN_GDO0, INPUT);
     attachInterrupt(digitalPinToInterrupt(PIN_GDO0), onEdge, CHANGE);
@@ -282,7 +300,7 @@ void loop() {
         lastRssiPrint = millis();
     }
 
-    // ---- Serial commands: 'q' toggle diagnostics, 'r' raw dump ----
+    // ---- Serial commands ----
     if (Serial.available()) {
         char c = Serial.read();
         if (c == 'q' || c == 'Q') {
@@ -290,6 +308,15 @@ void loop() {
             Serial.printf("[RSSI monitoring %s]\n", rssiMode ? "ON" : "OFF");
         } else if (c == 'r' || c == 'R') {
             dumpLastRaw();
+        } else if (c == '+') {
+            if (rxbwIndex < RXBW_COUNT - 1) { rxbwIndex++; }
+            applyFrontEnd();
+        } else if (c == '-') {
+            if (rxbwIndex > 0) { rxbwIndex--; }
+            applyFrontEnd();
+        } else if (c == 'g' || c == 'G') {
+            agcIndex = (agcIndex + 1) % AGC_COUNT;
+            applyFrontEnd();
         }
     }
 
@@ -373,21 +400,25 @@ void loop() {
     }
 
     Serial.printf("Frames    : %d\n", frameCount);
-    bool allMatch = true;
     for (int i = 0; i < frameCount; i++) {
         Serial.printf("  frame %d: %s\n", i, frames[i]);
-        if (i > 0 && strcmp(frames[i], frames[0]) != 0) { allMatch = false; }
     }
 
-    if (allMatch) {
-        char hex[MAX_FRAME_BITS / 4 + 2];
-        bitsToHex(frames[0], hex);
-        Serial.printf("Fingerprint: %s  (%d bits)  hex 0x%s  [all %d frames match]\n",
-                      frames[0], (int)strlen(frames[0]), hex, frameCount);
-    } else {
-        Serial.println("Frames DIFFER -> no stable fingerprint yet (compare the per-frame bits above).");
+    // Most common exact frame (mode) wins. As the front end gets cleaner, more
+    // frames become identical and this count climbs -> that is the tuning target.
+    int bestIdx = 0, bestVotes = 0;
+    for (int i = 0; i < frameCount; i++) {
+        int votes = 0;
+        for (int j = 0; j < frameCount; j++) {
+            if (strcmp(frames[i], frames[j]) == 0) { votes++; }
+        }
+        if (votes > bestVotes) { bestVotes = votes; bestIdx = i; }
     }
-    Serial.println("(press 'r' to dump raw pulses for this capture)");
+    char hex[MAX_FRAME_BITS / 4 + 2];
+    bitsToHex(frames[bestIdx], hex);
+    Serial.printf("Best      : %s  hex 0x%s  (%d/%d frames match)\n",
+                  frames[bestIdx], hex, bestVotes, frameCount);
+    Serial.println("(keys: r=raw dump  +/-=bandwidth  g=gain)");
     Serial.println("=========================");
     Serial.println();
     Serial.println("Listening... press another button.");
