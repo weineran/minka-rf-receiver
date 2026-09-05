@@ -60,6 +60,7 @@
 #define GAP_MIN_US      2000
 #define MAX_FRAMES      32     // most repeated frames we vote across
 #define MAX_FRAME_BITS  40     // most bit-cells we decode per frame
+#define MIN_FRAME_BITS  8      // ignore shorter decodes (noise fragments, not real frames)
 
 // ---- RSSI monitoring ----
 #define RSSI_INTERVAL_MS 500   // Print RSSI every 500ms
@@ -91,7 +92,7 @@ int rxbwIndex = 14;   // start at 650 kHz (the v2 wide setting)
 // AGCCTRL2 values from most to least LNA gain. Less gain = less noise slicing.
 const uint8_t AGC_STEPS[] = {0x03, 0x0B, 0x13, 0x1B};
 const int     AGC_COUNT   = sizeof(AGC_STEPS) / sizeof(AGC_STEPS[0]);
-int agcIndex = 0;     // start at max gain (the v2 sensitive setting)
+int agcIndex = 2;     // start at reduced LNA gain (0x13): steadier OOK slicing, less AGC pumping
 
 void IRAM_ATTR onEdge() {
     unsigned long now = micros();
@@ -385,26 +386,40 @@ void loop() {
         return;
     }
 
-    // Decode every gap-bracketed frame and list them, so we can see directly
-    // whether the repeats agree. (Debug view while we characterize the signal;
-    // this replaces the single voted fingerprint until the repeats are stable.)
+    // Decode each gap-bracketed frame, keeping only those long enough to be a
+    // real frame (short decodes are noise fragments). The most common surviving
+    // frame (mode) is the fingerprint: the true code wins the plurality even when
+    // the drifting tail corrupts individual repeats.
     char frames[MAX_FRAMES][MAX_FRAME_BITS + 1];
     int  frameCount = 0;
+    int  dropped = 0;
     for (int g = 0; g + 1 < nGaps && frameCount < MAX_FRAMES; g++) {
         int start = gapIdx[g] + 1;
         int end   = gapIdx[g + 1];
         if (end <= start) { continue; }
-        decodeFrame(captured, start, end, frames[frameCount]);
-        frameCount++;
+        char bits[MAX_FRAME_BITS + 1];
+        int nbits = decodeFrame(captured, start, end, bits);
+        if (nbits < MIN_FRAME_BITS) { dropped++; continue; }
+        strcpy(frames[frameCount++], bits);
     }
 
-    Serial.printf("Frames    : %d\n", frameCount);
+    if (frameCount == 0) {
+        Serial.printf("Frames    : 0 usable (%d noise fragments dropped). Press 'r' for raw.\n", dropped);
+        Serial.println("=========================");
+        Serial.println();
+        Serial.println("Listening... press another button.");
+        Serial.println();
+        return;
+    }
+
+    Serial.printf("Frames    : %d usable", frameCount);
+    if (dropped > 0) { Serial.printf(" (+%d noise dropped)", dropped); }
+    Serial.println();
     for (int i = 0; i < frameCount; i++) {
-        Serial.printf("  frame %d: %s\n", i, frames[i]);
+        Serial.printf("  %s\n", frames[i]);
     }
 
-    // Most common exact frame (mode) wins. As the front end gets cleaner, more
-    // frames become identical and this count climbs -> that is the tuning target.
+    // Most common exact frame (mode) wins.
     int bestIdx = 0, bestVotes = 0;
     for (int i = 0; i < frameCount; i++) {
         int votes = 0;
@@ -415,7 +430,7 @@ void loop() {
     }
     char hex[MAX_FRAME_BITS / 4 + 2];
     bitsToHex(frames[bestIdx], hex);
-    Serial.printf("Best      : %s  hex 0x%s  (%d/%d frames match)\n",
+    Serial.printf("Best      : %s  hex 0x%s  (%d/%d match)\n",
                   frames[bestIdx], hex, bestVotes, frameCount);
     Serial.println("(keys: r=raw dump  +/-=bandwidth  g=gain)");
     Serial.println("=========================");
